@@ -221,6 +221,13 @@ struct sunxi_gpadc_unit_reg {
 	unsigned long val;
 };
 
+/* Per-channel sysfs attribute for data0..dataN */
+struct gpadc_ch_attr {
+	struct device_attribute dev_attr;
+	char name[16];
+	u8 channel;
+};
+
 /* Registers which needs to be saved and restored before and after sleeping */
 static u32 sunxi_gpadc_regs_offset[] = {
 	GP_SR_REG,
@@ -288,6 +295,7 @@ struct sunxi_gpadc {
 	const struct sunxi_gpadc_hw_data *data;
 	unsigned char keypad_mapindex[CHANNEL_MAX_NUM][MAXIMUM_SCALE];
 	u32 regs_backup[ARRAY_SIZE(sunxi_gpadc_regs_offset)];
+	struct gpadc_ch_attr *ch_data_attrs[CHANNEL_MAX_NUM];
 };
 
 static struct sunxi_gpadc global_gpadc[GPADC_MAX_CHIP];
@@ -968,41 +976,29 @@ u32 sunxi_gpadc_read_channel_data(u32 controller_num, u8 channel)
 EXPORT_SYMBOL_GPL(sunxi_gpadc_read_channel_data);
 
 /*
- * cat data, get the voltage of the current channel
- * it should be executed first: echo channel > data, switch to gpadc channel
+ * cat dataN, read ADC value for channel N directly
+ * No need to switch channels first — each file maps to one channel.
+ * Multiple applications can read different channels concurrently.
  */
 static ssize_t
-sunxi_gpadc_data_show(struct device *dev, struct device_attribute *attr, char *buf)
+sunxi_gpadc_ch_data_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	unsigned int data;
+	struct gpadc_ch_attr *ch_attr =
+		container_of(attr, struct gpadc_ch_attr, dev_attr);
 	struct sunxi_gpadc *chip = dev_get_drvdata(dev);
+	u8 channel = ch_attr->channel;
+	u32 reg_val, data, vin_u, vin_m;
 
-	data = sunxi_gpadc_read_channel_data(chip->controller_num, chip->channel);
+	/* Check if channel is enabled */
+	reg_val = readl(chip->reg_base + GP_CS_EN_REG);
+	if ((reg_val & BIT(channel)) == 0)
+		return scnprintf(buf, PAGE_SIZE, "channel %u disabled\n", channel);
 
-	return scnprintf(buf, PAGE_SIZE, "voltage data is %u\n", data);
-}
+	data = sunxi_gpadc_read_data(chip->reg_base, channel);
+	vin_u = (VOL_REFER / GP_RESOLUTION_RATIO) * data;
+	vin_m = vin_u / 1000;
 
-/*
- * echo channel_n > data, switch to gpadc channel_n
- * eg: echo 0 > data, switch to channel 0
- */
-static ssize_t
-sunxi_gpadc_data_store(struct device *dev, struct device_attribute *attr,
-					const char *buf, size_t count)
-{
-	struct sunxi_gpadc *chip = dev_get_drvdata(dev);
-	struct sunxi_gpadc_unit_reg channel_para;
-	int err;
-
-	err = sunxi_gpadc_parse_unit_str(buf, count, &channel_para);
-	if (err) {
-		dev_err(chip->dev, "%s(): %d: err, invalid data para!\n", __func__, __LINE__);
-		return err;
-	}
-
-	chip->channel = channel_para.val;
-
-	return count;
+	return scnprintf(buf, PAGE_SIZE, "%u\n", vin_m);
 }
 
 static struct device_attribute gpadc_class_attrs[] = {
@@ -1010,7 +1006,6 @@ static struct device_attribute gpadc_class_attrs[] = {
 	__ATTR(vol,    0644, sunxi_gpadc_vol_show,    sunxi_gpadc_vol_store),
 	__ATTR(sr,     0644, sunxi_gpadc_sr_show,     sunxi_gpadc_sr_store),
 	__ATTR(filter, 0644, sunxi_gpadc_filter_show, sunxi_gpadc_filter_store),
-	__ATTR(data,   0644, sunxi_gpadc_data_show,   sunxi_gpadc_data_store),
 };
 
 static struct class gpadc_class = {
@@ -1401,7 +1396,12 @@ static int sunxi_gpadc_hw_init(struct sunxi_gpadc *chip)
 
 	sunxi_gpadc_calibration_enable(chip->reg_base);
 	sunxi_gpadc_set_mode(chip->reg_base, config->mode_select);
-	sunxi_gpadc_datairq_control(chip->reg_base, true);
+
+	/* Only enable data IRQ if any interrupt-driven channel is configured */
+	if (config->keyadc_select || config->data_select ||
+	    config->cld_select || config->chd_select)
+		sunxi_gpadc_datairq_control(chip->reg_base, true);
+
 	sunxi_gpadc_enable(chip->reg_base);
 
 	return 0;
@@ -1413,7 +1413,10 @@ static void sunxi_gpadc_hw_exit(struct sunxi_gpadc *chip)
 	int i;
 
 	sunxi_gpadc_disable(chip->reg_base);
-	sunxi_gpadc_datairq_control(chip->reg_base, false);
+
+	if (config->keyadc_select || config->data_select ||
+	    config->cld_select || config->chd_select)
+		sunxi_gpadc_datairq_control(chip->reg_base, false);
 
 	for (i = 0; i < chip->channel_num; i++) {
 		if (config->channel_select & BIT(i)) {
@@ -1596,6 +1599,7 @@ static int sunxi_gpadc_sysfs_create(struct sunxi_gpadc *chip)
 	if (IS_ERR(chip->class_dev))
 		return PTR_ERR(chip->class_dev);
 
+	/* Create common attributes: status, vol, sr, filter */
 	for (i = 0; i < ARRAY_SIZE(gpadc_class_attrs); i++) {
 		err = device_create_file(chip->class_dev, &gpadc_class_attrs[i]);
 		if (err) {
@@ -1608,13 +1612,66 @@ static int sunxi_gpadc_sysfs_create(struct sunxi_gpadc *chip)
 		}
 	}
 
+	/* Create per-channel dataN attributes (data0, data1, ... dataN-1) */
+	for (i = 0; i < chip->channel_num; i++) {
+		struct gpadc_ch_attr *ch_attr;
+
+		ch_attr = devm_kzalloc(chip->dev, sizeof(*ch_attr), GFP_KERNEL);
+		if (!ch_attr) {
+			err = -ENOMEM;
+			goto err_ch_attrs;
+		}
+
+		snprintf(ch_attr->name, sizeof(ch_attr->name), "data%d", i);
+		ch_attr->channel = i;
+		ch_attr->dev_attr.attr.name = ch_attr->name;
+		ch_attr->dev_attr.attr.mode = 0444;
+		ch_attr->dev_attr.show = sunxi_gpadc_ch_data_show;
+		ch_attr->dev_attr.store = NULL;
+		sysfs_attr_init(&ch_attr->dev_attr.attr);
+
+		err = device_create_file(chip->class_dev, &ch_attr->dev_attr);
+		if (err) {
+			dev_err(chip->dev, "failed to create %s\n", ch_attr->name);
+			goto err_ch_attrs;
+		}
+
+		chip->ch_data_attrs[i] = ch_attr;
+	}
+
 	return 0;
+
+err_ch_attrs:
+	/* Clean up per-channel attrs already created */
+	while (i--) {
+		if (chip->ch_data_attrs[i]) {
+			device_remove_file(chip->class_dev,
+					   &chip->ch_data_attrs[i]->dev_attr);
+			chip->ch_data_attrs[i] = NULL;
+		}
+	}
+	/* Clean up common attrs */
+	for (i = 0; i < ARRAY_SIZE(gpadc_class_attrs); i++)
+		device_remove_file(chip->class_dev, &gpadc_class_attrs[i]);
+
+	device_destroy(&gpadc_class, chip->controller_num);
+	return err;
 }
 
 static void sunxi_gpadc_sysfs_destroy(struct sunxi_gpadc *chip)
 {
 	int i;
 
+	/* Remove per-channel dataN attributes */
+	for (i = 0; i < chip->channel_num; i++) {
+		if (chip->ch_data_attrs[i]) {
+			device_remove_file(chip->class_dev,
+					   &chip->ch_data_attrs[i]->dev_attr);
+			chip->ch_data_attrs[i] = NULL;
+		}
+	}
+
+	/* Remove common attributes */
 	for (i = 0; i < ARRAY_SIZE(gpadc_class_attrs); i++)
 		device_remove_file(chip->class_dev, &gpadc_class_attrs[i]);
 
@@ -1663,10 +1720,14 @@ static int sunxi_gpadc_probe(struct platform_device *pdev)
 		goto err1;
 	}
 
-	err = sunxi_gpadc_inputdev_register(chip);
-	if (err) {
-		dev_err(chip->dev, "failed to input_register\n");
-		goto err2;
+	/* Skip input device registration when no IRQ-driven channels configured */
+	if (chip->gpadc_config.keyadc_select || chip->gpadc_config.data_select ||
+	    chip->gpadc_config.cld_select || chip->gpadc_config.chd_select) {
+		err = sunxi_gpadc_inputdev_register(chip);
+		if (err) {
+			dev_err(chip->dev, "failed to input_register\n");
+			goto err2;
+		}
 	}
 
 	err = sunxi_gpadc_sysfs_create(chip);
@@ -1686,7 +1747,9 @@ static int sunxi_gpadc_probe(struct platform_device *pdev)
 	return 0;
 
 err3:
-	sunxi_gpadc_inputdev_unregister(chip);
+	if (chip->gpadc_config.keyadc_select || chip->gpadc_config.data_select ||
+	    chip->gpadc_config.cld_select || chip->gpadc_config.chd_select)
+		sunxi_gpadc_inputdev_unregister(chip);
 err2:
 	sunxi_gpadc_hw_exit(chip);
 err1:
@@ -1701,7 +1764,9 @@ static int sunxi_gpadc_remove(struct platform_device *pdev)
 	struct sunxi_gpadc *chip = platform_get_drvdata(pdev);
 
 	sunxi_gpadc_sysfs_destroy(chip);
-	sunxi_gpadc_inputdev_unregister(chip);
+	if (chip->gpadc_config.keyadc_select || chip->gpadc_config.data_select ||
+	    chip->gpadc_config.cld_select || chip->gpadc_config.chd_select)
+		sunxi_gpadc_inputdev_unregister(chip);
 	sunxi_gpadc_hw_exit(chip);
 	sunxi_gpadc_resource_put(chip);
 
