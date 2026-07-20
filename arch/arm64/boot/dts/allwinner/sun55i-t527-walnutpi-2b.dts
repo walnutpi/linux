@@ -334,31 +334,33 @@
 
 
 &gpadc0 {
-	channel_num = <2>;
-	channel_select = <3>;
-	channel_data_select = <3>;
-	channel_compare_select = <3>;
-	channel_cld_select = <3>;
-	channel_chd_select = <3>;
+	channel_num = <12>;
+	gpadc_sample_rate = <1000>; //1k采样率
+	channel_select = <0xfff>;
+	channel_data_select = <0>;
+	channel_compare_select = <0>;
+	channel_cld_select = <0>;
+	channel_chd_select = <0>;
 	channel0_compare_lowdata = <1700000>;
 	channel0_compare_higdata = <1200000>;
 	channel1_compare_lowdata = <460000>;
 	channel1_compare_higdata = <1200000>;
-	status = "disabled";
+	status = "okay";
 };
 
 &gpadc1 {
-	channel_num = <2>;
-	channel_select = <3>;
-	channel_data_select = <3>;
-	channel_compare_select = <3>;
-	channel_cld_select = <3>;
-	channel_chd_select = <3>;
+	channel_num = <12>;
+	gpadc_sample_rate = <1000>; //1k采样率
+	channel_select = <0xfff>;
+	channel_data_select = <0>;
+	channel_compare_select = <0>;
+	channel_cld_select = <0>;
+	channel_chd_select = <0>;
 	channel0_compare_lowdata = <1700000>;
 	channel0_compare_higdata = <1200000>;
 	channel1_compare_lowdata = <460000>;
 	channel1_compare_higdata = <1200000>;
-	status = "disabled";
+	status = "okay";
 };
 
 &ledc  {
