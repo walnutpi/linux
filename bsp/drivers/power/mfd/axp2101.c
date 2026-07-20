@@ -3481,6 +3481,15 @@ static void axp2202_dts_parse(struct axp20x_dev *axp20x)
 	} else {
 		regmap_update_bits(map, AXP2202_PWROFF_EN, BIT(2), 0);
 	}
+
+	/* init backup battery (VBACKUP) charging */
+	if (of_property_read_u32(node, "pmu_backup_chg_en", &val))
+		val = 0;
+	if (val) {
+		regmap_update_bits(map, AXP2202_MODULE_EN, BIT(3), BIT(3));
+	} else {
+		regmap_update_bits(map, AXP2202_MODULE_EN, BIT(3), 0);
+	}
 }
 
 static void axp8191_dts_parse(struct axp20x_dev *axp20x)
