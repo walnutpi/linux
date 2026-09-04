@@ -226,7 +226,6 @@
 		pmu_irq_wakeup = <1>;
 		pmu_hot_shutdown = <1>;
 		pmu_over_current = <1>;
-		pmu_backup_chg_en = <1>;
 		pmu_hot_shutdown_value = <125>;
 		wakeup-source;
 		
